@@ -18,8 +18,8 @@ def call(Map options) {
     def String kitchen_verifier_file = options.get('kitchen_verifier_file', '/var/jenkins/workspace/nox-verifier.yml')
     def String kitchen_platforms_file = options.get('kitchen_platforms_file', '/var/jenkins/workspace/nox-platforms.yml')
     def String[] extra_codecov_flags = options.get('extra_codecov_flags', [])
-    def String ami_image_id = options.get('ami_image_id', '')
     def Boolean retrying = options.get('retrying', false)
+    def Boolean upload_test_coverage = options.get('upload_test_coverage', true)
     def String vm_hostname = computeMachineHostname(
         env: env,
         distro_name: distro_name,
@@ -32,9 +32,18 @@ def call(Map options) {
 
     def Boolean retry_build = false
 
+    // In case we're testing golden images
+    def String ami_image_id = options.get('ami_image_id', '')
+    def String vagrant_box = options.get('vagrant_box', '')
+    def Boolean delete_vagrant_box = true
+
     def Boolean macos_build = false
     if ( distro_name == 'macosx' ) {
         macos_build = true
+        if ( vagrant_box == '' ) {
+            delete_vagrant_box = false
+            vagrant_box = "https://artifactory.saltstack.net/artifactory/api/vagrant/vagrant-boxes/macos/${distro_version}-ci-${salt_target_branch}"
+        }
     }
 
     // Define a global pipeline timeout. This is the test run timeout with one(1) additional
@@ -83,6 +92,10 @@ def call(Map options) {
         environ << "AMI_IMAGE_ID=${ami_image_id}"
     }
 
+    if ( vagrant_box != '' ) {
+        environ << "VAGRANT_BOX=${vagrant_box}"
+    }
+
     wrappedNode(jenkins_slave_label, global_timeout, notify_slack_channel) {
         withEnv(environ) {
 
@@ -106,8 +119,30 @@ def call(Map options) {
             // Checkout the repo
             stage('Clone') {
                 cleanWs notFailBuild: true
-                checkout scm
-                sh 'git fetch --no-tags https://github.com/saltstack/salt.git +refs/heads/${SALT_TARGET_BRANCH}:refs/remotes/origin/${SALT_TARGET_BRANCH}'
+                if ( ami_image_id == '' ) {
+                    checkout scm
+                    sh 'git fetch --no-tags https://github.com/saltstack/salt.git +refs/heads/${SALT_TARGET_BRANCH}:refs/remotes/origin/${SALT_TARGET_BRANCH}'
+                } else {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [
+                            [name: "${salt_target_branch}"]
+                        ],
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [
+                            [
+                                $class: 'CloneOption',
+                                noTags: false,
+                                reference: '',
+                                shallow: true
+                            ]
+                        ],
+                        submoduleCfg: [],
+                        userRemoteConfigs: [
+                            [url: "https://github.com/saltstack/salt.git"]
+                        ]
+                    ])
+                }
             }
 
             // Setup the kitchen required bundle
@@ -116,6 +151,41 @@ def call(Map options) {
                     sh 'bundle install --with vagrant macos --without ec2 windows opennebula docker'
                 } else {
                     sh 'bundle install --with ec2 windows --without docker macos opennebula vagrant'
+                    if ( ami_image_id != '' ) {
+                        // Make sure we don't get any promoted images
+                        writeFile encoding: 'utf-8', file: '.kitchen.local.yml', text: """\
+                        driver:
+                          image_search:
+                            description: 'CI-STAGING *'
+                        verifier:
+                          coverage: false
+                        """.stripIndent()
+                    }
+                }
+            }
+
+            if ( macos_build == false ) {
+                if ( ami_image_id != '' ) {
+                    stage('Discover AMI') {
+                        command_output = sh returnStdout: true, script:
+                            '''
+                            bundle exec kitchen diagnose $TEST_SUITE-$TEST_PLATFORM | grep 'image_id:' | awk '{ print $2 }'
+                            '''
+                        image_id = command_output.trim()
+                        if ( image_id != '' ) {
+                            addInfoBadge id: 'discovered-ami-badge', text: "Discovered AMI ${image_id} for this running instance"
+                            createSummary(icon: "/images/48x48/attribute.png", text: "Discovered AMI: ${image_id}")
+                        } else {
+                            addWarningBadge id: 'discovered-ami-badge', text: "No AMI discovered to promote"
+                            createSummary(icon: "/images/48x48/warning.png", text: "No AMI discovered to promote")
+                        }
+                        command_output = sh returnStdout: true, script:
+                            '''
+                            grep 'region:' $SALT_KITCHEN_DRIVER | awk '{ print $2 }'
+                            '''
+                        ec2_region = command_output.trim()
+                        println "Discovered EC2 Region: ${ec2_region}"
+                    }
                 }
             }
 
@@ -236,30 +306,41 @@ def call(Map options) {
                         sh '''
                         bundle exec kitchen destroy $TEST_SUITE-$TEST_PLATFORM; echo "ExitCode: $?";
                         '''
+                        try {
+                            if ( delete_vagrant_box ) {
+                                sh """
+                                vagrant box delete ${vagrant_box}
+                                """
+                            }
+                        } catch (Exception delete_vagrant_box_error) {
+                            println "Failed to delete vagrant box: ${delete_vagrant_box_error}"
+                        }
                     }
-                    stage('Upload Coverage') {
-                        if ( run_full ) {
-                            def distro_strings = [
-                                distro_name,
-                                distro_version
-                            ]
-                            def report_strings = (
-                                [python_version] + nox_env_name.split('-') + extra_codecov_flags
-                            ).flatten()
-                            uploadCodeCoverage(
-                                report_path: 'artifacts/coverage/tests.xml',
-                                report_name: "${distro_strings.join('-')}-${report_strings.join('-')}-tests",
-                                report_flags: ([distro_strings.join('')] + report_strings + ['tests']).flatten()
-                            )
-                            sleep(
-                                time: 5,
-                                unit: 'SECONDS'
-                            )
-                            uploadCodeCoverage(
-                                report_path: 'artifacts/coverage/salt.xml',
-                                report_name: "${distro_strings.join('-')}-${report_strings.join('-')}-salt",
-                                report_flags: ([distro_strings.join('')] + report_strings + ['salt']).flatten()
-                            )
+                    if ( upload_test_coverage == true ) {
+                        stage('Upload Coverage') {
+                            if ( run_full ) {
+                                def distro_strings = [
+                                    distro_name,
+                                    distro_version
+                                ]
+                                def report_strings = (
+                                    [python_version] + nox_env_name.split('-') + extra_codecov_flags
+                                ).flatten()
+                                uploadCodeCoverage(
+                                    report_path: 'artifacts/coverage/tests.xml',
+                                    report_name: "${distro_strings.join('-')}-${report_strings.join('-')}-tests",
+                                    report_flags: ([distro_strings.join('')] + report_strings + ['tests']).flatten()
+                                )
+                                sleep(
+                                    time: 5,
+                                    unit: 'SECONDS'
+                                )
+                                uploadCodeCoverage(
+                                    report_path: 'artifacts/coverage/salt.xml',
+                                    report_name: "${distro_strings.join('-')}-${report_strings.join('-')}-salt",
+                                    report_flags: ([distro_strings.join('')] + report_strings + ['salt']).flatten()
+                                )
+                            }
                         }
                     }
                 }
