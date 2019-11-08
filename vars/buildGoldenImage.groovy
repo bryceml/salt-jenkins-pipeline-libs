@@ -155,7 +155,7 @@ def call(Map options) {
                             }
                             cleanWs notFailBuild: true
                             image_created = true
-                            ami_built_msg = "Built Vagrant Box ${vagrant_box_name}(${vagrant_versioned_box_url})"
+                            ami_built_msg = "Built Vagrant Box ${vagrant_box_name}(${vagrant_box_version})"
                             addInfoBadge(
                                 id: 'build-ami-badge',
                                 text: ami_built_msg
